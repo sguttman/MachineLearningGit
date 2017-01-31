@@ -1,0 +1,228 @@
+---
+title: "Machine Learning Final Assignment"
+author: "Steve Guttman"
+date: "Jan 31, 2016"
+output:
+  html_document:
+    theme: journal
+  pdf_document: default
+  word_document: default
+---
+<style>
+blockquote {font-size: small; font-family:"Open Sans"; background-color:#eafaff; border-left:6px solid #2d6cab; margin-right:100px;}
+h3 {color:#2d6cab; font-size:20px; border-bottom:1px solid #2d6cab}
+.MathJax {color:#1d4e80;}
+html {font-family:"Open Sans", font-size:smaller}
+td {padding:10px;}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+## Executive Summary
+This report details an analysis and prediction of raw exercise data using machine learning techniques. The data set was split into training and testing sets and covariates were reduced using a variety of techniques. The reduced data set was trained on 3 different ML algorithms: 1) Random Forests, 2) Gradient Boosting, 3) Linear Discriminant Analysis.  
+
+The best results were obtained with Random Forests with nearly 100% accuracy on the training set and over 99% accuracy on the test set. This yielded an out-of-sample error rate of 0.62%.
+  
+## Introduction
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. This data set contains info from accelerometers sited on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. This data set is credited to: http://groupware.les.inf.puc-rio.br/har.
+
+#### Caveat
+As a caveat, this assignment appears to me to be poorly structured. The supplied data contains both  raw data and a line representing the processing of the raw data into a number of additional variables (kurtosis & skew). The raw data is indicated by new_window = "no" and the postprocessed data by new_window = "yes". Because of the nature of the supplied testing data set (which is all raw data), it looks like the instructors want us to make predictions using single lines of raw data. *Building a predictor off the raw data is meaningless* because a sequence of raw data points is needed to determine whether an exercise was done correctly or not. However, given that this appears to be the assignment--that's what this analysis will attempt to do.
+
+## Data Import & Filtering
+Assignment data is imported directly from the associated URIs (after checking to see whether it already exists). As mentioned, raw and aggregate data is intermixed. We eliminate the aggregate data by filtering over the **num_window** variable, and partion the official training data into training and test sets (train/test). 
+  
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# requirements
+require(ggplot2); require(plyr); require(dplyr); require(caret); require(mlbench); require(e1071)
+library(doParallel)
+#cl = makeCluster(as.numeric(Sys.getenv('NUMBER_OF_PROCESSORS')))
+cl = makeCluster(4)
+registerDoParallel(cl)
+
+setwd("D:/Steve/Documents/Coursera/8. Machine Learning")
+```  
+```{r,  message=FALSE, warning=FALSE, cache=TRUE}
+## Download the relevant data sets if they don't exist already
+     if( !file.exists("pml-training.csv")) {
+          fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+          download.file( fileUrl, destfile = "pml-training.csv")
+          dateDownloaded <- date()
+     }
+     training = read.csv("pml-training.csv", stringsAsFactors = FALSE, na.strings = c("#DIV/0!"))
+     
+     if( !file.exists("pml-testing.csv")) {
+          fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+          download.file( fileUrl, destfile = "pml-testing.csv")
+          dateDownloaded2 <- date()
+     }
+     testing = read.csv("pml-testing.csv", stringsAsFactors = FALSE, na.strings = c("#DIV/0!"))
+     
+## Remove lines that don't contain postprocessed data (as indicated by new_window = "no")
+     training2 = filter(training, new_window == "no")
+
+## Break the official training set into training and testing components
+     set.seed(336699)
+     inTrain = createDataPartition(y=training2$classe, p=0.80, list=FALSE)
+     train = training2[inTrain,]
+     test = training2[-inTrain,]
+```  
+### Preprocessing & Data Reduction
+
+Before performing the analysis, we clean up the data and get rid of variables that aren't meaningful. To start, we'll cleanse the data set of covariates that don't have any bearing on the dependent variable--based on our understanding of the problem space. These include sequence number, user name, timestamps, window_num.   
+  
+In reading the file, we converted the #DIV/0! entries to na. We don't really know if these signify a really large number or just 0/0. However, I suspect it's 0/0--essentially meaning no measurement. Since these are measurements of physical actions, it is more likely that they are zero--not infinite. So, we will convert those nas to and we'll remove covariates that are either constant or very close to zero--using *nearZeroVar* from the caret package.  
+
+In order to remove unnecessary variables, we looked at the correlation between covariates and removed those that were highly correlated. 
+
+```{r  message=FALSE, warning=FALSE}
+     plotdf = data.frame("Operations"=c("1.Original","2.Remove Irrelevant","3.Remove Near Zero","4.Remove Correlated"), "Covariates"=c(159,0,0,0))
+
+# Remove irrelevant covariates
+     removeIrrel = function(df) {df[,1:7] = NULL; df}
+     train = removeIrrel(train)
+     plotdf[2,2] = ncol(train)-1
+
+# Convert na values (previously #DIV/0!) to zeros.
+     train[is.na(train)] = 0
+     
+# Find and remove near zero covariates
+     nZero = nearZeroVar(train)
+     train = train[,-nZero]
+     plotdf[3,2] = ncol(train)-1
+     
+# Find highly correlated numeric features
+# First convert character columns to numeric
+     
+     charCols = which(sapply(train[,1:ncol(train)], class) == "character")
+     length(charCols) = length(charCols) - 1  #Don't want to convert classe variable at end to numeric
+     train[,charCols] = sapply(train[,charCols], as.numeric)
+     
+     correlationMatrix <- cor(train[,1:ncol(train)-1])
+     highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.75)
+     train = train[,-highlyCorrelated]
+     plotdf[4,2] = ncol(train)-1
+```
+**Via these operations, we were able to reduce the number of features from 159 to 31.**
+
+```{r message=FALSE, warning=FALSE, fig.width=5, fig.height=3, echo=FALSE}
+g = ggplot(plotdf, aes(x=Operations, y=Covariates))
+g = g + geom_bar(stat="identity" ,fill=c("#4271AE"), color="darkgray")
+g = g + geom_text(data=plotdf, aes(x=Operations, y=Covariates/2, label = Covariates),size=4, color="white")
+g = g + ggtitle("Feature Reduction") + ylab("Number of Covariates")
+g = g + theme_bw()
+g = g + theme(axis.text.x=element_text(colour="black", size = 7))
+g
+```
+
+### Ranking of Feature Importance
+Normally, we would run a function to rate the relative importance of the various covariates to the prediction. Unfortunately, there were problems in executing functions that ranked importance. So, it was decided to run ML algorithms with the entire set of (reduced) covariates.
+
+### Analysis & Strategy - Application of ML Algorithms on Training Set
+Since this class has introduced a variety of ML techniques, the analysis takes three of those techniques and compares the results on predicting results of this particular data set. Those techniques include:
+
+- Random forest (rf)
+- Boosting (gba)
+- Linear discriminant analysis (lda)
+
+Based on the results, we may combine/aggregate the models. 
+  
+#### Cross-Validation
+Cross validation was accomplished in two ways: 
+  
+1. The formal training set was broken into train/test pieces - 80%/20%. The Test set was not used in any training. Test data is pre-processed using the same covariant-reduction as the Train data (duplicating the same columns as the Train set)  
+2. Cross-validation within the Train data set used the defaults for each of the ML techniques. My belief is that all of these techniques us a 10-iteration bootstrap. The Random Forest technique iterates over different values of mtry (variables used at a node) to find the optimal (mtry=2 in this case).
+
+```{r  message=FALSE, warning=FALSE, cache=TRUE}
+# Apply pre-processing to test set
+preFit = function(df) {  df = removeIrrel(df); 
+                         df[is.na(df)] = 0;
+                         df = df[,-nZero];
+                         df = df[,-highlyCorrelated];
+                         df
+}
+test = preFit(test)
+
+# Perform three analyses on training data
+     set.seed(336699)
+     mod_rf = train(classe ~ ., data=train, method = "rf")
+     mod_gbm = train(classe ~ ., data=train, method = "gbm")
+     mod_lda = train(classe ~ ., data=train, method = "lda")
+
+     pred_rf = predict(mod_rf, newdata=train)
+     pred_gbm = predict(mod_gbm, newdata=train)
+     pred_lda = predict(mod_lda, newdata=train)
+     
+     conf_rf = confusionMatrix(pred_rf, reference = train$classe)
+     conf_gbm = confusionMatrix(pred_gbm, reference = train$classe)
+     conf_lda = confusionMatrix(pred_lda, reference = train$classe)
+     
+     results = data.frame("Technique"=c("Random Forest","Boosting","Linear Discr Analysis"), "Accuracy"=c(0,0,0))
+     results[1,2] = paste0(round(conf_rf[[3]][1]*100,2),"%")
+     results[2,2] = paste0(round(conf_gbm[[3]][1]*100,2),"%")
+     results[3,2] = paste0(round(conf_lda[[3]][1]*100,2),"%")
+```
+  
+#### Training Results  
+```{r message=FALSE, warning=FALSE}
+     results
+```
+
+#### Model Parameters  
+##### Random Forest
+For the **random forest**, we can see that the most accurate results occurred with 2 predictors.  
+```{r message=FALSE, warning=FALSE, fig.width=5, fig.height=3, echo=FALSE}
+plot(mod_rf)
+```
+  
+##### Gradient Boosting  
+For the **gradient boosting**, the most accurate results were generated with the deepest tree depth (3).  
+```{r message=FALSE, warning=FALSE, fig.width=5, fig.height=3, echo=FALSE}
+plot(mod_gbm)
+```
+  
+### Testing 3 Models on "Test" Subset of Training Data   
+```{r  message=FALSE, warning=FALSE, cache=TRUE}
+
+# Perform three analyses on test subset of training data
+
+     tpred_rf = predict(mod_rf, newdata=test)
+     tpred_gbm = predict(mod_gbm, newdata=test)
+     tpred_lda = predict(mod_lda, newdata=test)
+     
+     tconf_rf = confusionMatrix(tpred_rf, reference = test$classe)
+     tconf_gbm = confusionMatrix(tpred_gbm, reference = test$classe)
+     tconf_lda = confusionMatrix(tpred_lda, reference = test$classe)
+     
+     tresults = data.frame("Technique"=c("Random Forest","Boosting","Linear Discr Analysis"), "Accuracy"=c(0,0,0))
+     tresults[1,2] = paste0(round(tconf_rf[[3]][1]*100,2),"%")
+     tresults[2,2] = paste0(round(tconf_gbm[[3]][1]*100,2),"%")
+     tresults[3,2] = paste0(round(tconf_lda[[3]][1]*100,2),"%")
+     paste("<strong>Test subset of Training data</strong>")
+```
+  
+#### Test Results  
+```{r message=FALSE, warning=FALSE}
+     tresults
+```
+
+** Based on these results, RANDOM FORESTS performed best**.
+
+### Out-of-Sample Error Estimation
+
+The out-of-sample error rate is simply the number of inaccurate predictions divided by the total number of predictions. It's basically 1 - accuracy. In this case:  
+```{r  message=FALSE, warning=FALSE}
+OSError =  paste0(round(100-tconf_rf[[3]][1]*100,2),"%")
+#OSError   
+```
+**The out-of-sample error rate was `r OSError`.**  
+  
+### Predictions for Testing Set  
+```{r message=FALSE, warning=FALSE}
+     testing = preFit(testing)
+     testing_pred_rf = predict(mod_rf, newdata=testing)
+     testing_pred_rf
+```
